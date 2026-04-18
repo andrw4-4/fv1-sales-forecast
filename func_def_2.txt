@@ -1,0 +1,118 @@
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error
+import numpy as np
+
+# ── Feature engineering ────────────────────────────────────────────
+def crear_features(serie, vacaciones):
+    df = serie.copy()
+    
+    # Features de calendario
+    df['mes']           = df['ds'].dt.month
+    df['semana_año']    = df['ds'].dt.isocalendar().week.astype(int)
+    df['trimestre']     = df['ds'].dt.quarter
+    df['semestre'] = np.where(df['trimestre'] <= 2, 1, 2)
+    
+    # Lags (ventas semanas anteriores)
+    # Lag condicional: si la semana anterior fue vacación, usar media histórica
+    df['lag_1'] = df['y'].shift(1)
+    
+    df['lag_2']  = df['y'].shift(2)   # 2 semanas atrás
+    df['lag_4']  = df['y'].shift(4)   # 1 mes atrás
+    df['lag_52'] = df['y'].shift(52)  # mismo periodo año anterior
+    
+    # Rolling means
+    df['rolling_4']  = df['y'].shift(1).rolling(4).mean()   # promedio 1 mes
+    df['rolling_8']  = df['y'].shift(1).rolling(8).mean()   # promedio 2 meses
+    
+    # Features de vacaciones (binarias)
+    for holiday in vacaciones['holiday'].unique():
+        fechas_holiday = vacaciones[vacaciones['holiday'] == holiday]['ds']
+        # Marcar semanas que contienen días de ese holiday
+        df[f'hol_{holiday}'] = df['ds'].apply(
+            lambda x: 
+            int(any(
+                (fechas_holiday >= x) & 
+                (fechas_holiday < x + pd.Timedelta(days=7))
+            ))
+        )
+    
+    # Semanas antes/después de vacaciones (efecto anticipación)
+    df['semanas_antes_verano'] = df['ds'].apply(
+        lambda x: max(0, 4 - (
+            vacaciones[vacaciones['holiday'] == 'vacaciones_verano']['ds'].min() - x
+        ).days // 7) if (
+            vacaciones[vacaciones['holiday'] == 'vacaciones_verano']['ds'].min() - x
+        ).days > 0 else 0
+    )
+    #semana academica
+    
+    mapa_vacas = vacaciones.set_index('ds')['holiday'].to_dict()
+
+    
+    hitos_inicio = [pd.Timestamp('2024-01-22'), pd.Timestamp('2024-08-05'),
+                pd.Timestamp('2025-01-20'), pd.Timestamp('2025-08-04'),
+                pd.Timestamp('2026-01-19'), pd.Timestamp('2026-08-03')] # 19 de enero es SEMANA 1
+    
+    df['semana_academica'] = df['ds'].apply(lambda x: 
+    # PRIORIDAD 1: Si es un inicio oficial, ES SEMANA 1 (Sin importar nada más)
+    1 if x in hitos_inicio else 
+    
+    # PRIORIDAD 2: Hitos que "detienen" o "cambian" la demanda
+    17 if 'finales' in mapa_vacas.get(x, '') else 
+    0  if any(h in mapa_vacas.get(x, '') for h in ['receso', 'santa', 'induccion']) else 
+    
+    # PRIORIDAD 3: Si no es inicio, pero sigue siendo periodo de vacaciones
+    -1 if 'vacaciones' in mapa_vacas.get(x, '') else 
+    
+    # PRIORIDAD 4: Conteo dinámico de semanas de clase
+    (lambda inicio: 
+        len([l for l in pd.date_range(inicio, x, freq='W-MON') 
+             if not any(h in mapa_vacas.get(l, '') for h in ['receso', 'santa', 'finales', 'induccion'])])
+    )(max([i for i in hitos_inicio if i <= x], default=pd.Timestamp('1900-01-01')))
+)
+    
+    # Definimos las semanas críticas según tu conocimiento de Uniandes
+    semanas_parciales_1 = [7, 8]
+    semanas_parciales_2 = [12, 13]
+
+    # Creamos las columnas en el DataFrame de features
+    df['inicio_parciales_1'] = (df['semana_academica'] == 7).astype(int)  # caída fuerte
+    df['fin_parciales_1']    = (df['semana_academica'] == 8).astype(int)  # recuperación
+# Reemplaza es_parciales_1 en FEATURES
+
+    df['inicio_parciales_2'] = (df['semana_academica'] == 12).astype(int)  # caída fuerte
+    df['fin_parciales_2']    = (df['semana_academica'] == 13).astype(int)
+
+    df['pre_evento'] = (df['semana_academica'].shift(-1) == 0).astype(int)
+
+    # 1. Creamos los del MES (periodo = 12)
+    df['mes_sin'] = np.sin(2 * np.pi * df['ds'].dt.month / 12)
+    df['mes_cos'] = np.cos(2 * np.pi * df['ds'].dt.month / 12)
+
+    # 2. Creamos los de la SEMANA DEL AÑO (periodo = 52)
+    # Usamos isocalendar() para ser precisos con las semanas
+    df['semana_sin'] = np.sin(2 * np.pi * df['ds'].dt.isocalendar().week / 52)
+    df['semana_cos'] = np.cos(2 * np.pi * df['ds'].dt.isocalendar().week / 52)
+
+    df['vuelta_a_clases'] = df['semana_academica'].isin([1, 2]).astype(int)
+    df['post_vacaciones'] = (
+    (df['semana_academica'] == 1) | 
+    (df['semana_academica'].shift(1) == -1)  # -1 = semana de receso
+).astype(int)
+    df['lag_1_clean'] = df.apply(
+    lambda row: df[df['semana_academica'] == row['semana_academica']]['y'].mean()if row['lag_1'] == 0 and row['semana_academica'] in [1, 2]
+    else row['lag_1'], axis=1)
+    df['lag_x_parciales'] = df['lag_1'] * df['inicio_parciales_1']
+
+
+    
+    return df
+
+# ── Aplicar features ───────────────────────────────────────────────
+df_features = crear_features(serie_combinada, vacaciones)
+
+print("Features creadas:")
+print(df_features.columns.tolist())
+print(f"\nShape: {df_features.shape}")
+print(df_features.tail(5).to_string())
+df_features

@@ -1,0 +1,226 @@
+import pandas as pd
+import numpy as np
+import warnings
+import optuna
+from prophet import Prophet
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error
+
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────
+smape_fn = lambda y, yhat: (2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat) + 1e-8)).mean()
+
+FEATURES_HIBRIDO = [
+    'yhat', 'yhat_lower', 'yhat_upper',
+    'mes', 'semana_año', 'trimestre',
+    'lag_1', 'lag_2', 'lag_4',
+    'rolling_4', 'rolling_8',
+    'hol_semana_santa', 'hol_semana_receso_verano',
+    'hol_examenes_finales', 'hol_vacaciones_verano',
+    'hol_semana_receso_invierno', 'hol_vacaciones_invierno',
+    'hol_cierre_oct_dic_2024', 'semanas_antes_verano'
+]
+
+def entrenar_prophet_params(serie_train, params, periods_ahead=0):
+    """Entrena Prophet con parámetros customizados."""
+    m = Prophet(
+        yearly_seasonality       = False,
+        weekly_seasonality       = False,
+        daily_seasonality        = False,
+        seasonality_mode         = params['seasonality_mode'],
+        holidays                 = vacaciones,
+        changepoint_prior_scale  = params['changepoint_prior_scale'],
+        seasonality_prior_scale  = params['seasonality_prior_scale'],
+        holidays_prior_scale     = params.get('holidays_prior_scale', 20.0),
+        changepoint_range        = params['changepoint_range'],
+    )
+    m.add_seasonality(name='semestral', period=24, fourier_order=5)
+    m.add_country_holidays(country_name='CO')
+    m.fit(serie_train)
+
+    future   = m.make_future_dataframe(periods=periods_ahead, freq='W-MON')
+    forecast = m.predict(future)
+    for col in ['yhat', 'yhat_lower', 'yhat_upper']:
+        forecast[col] = np.ceil(forecast[col].clip(0)).astype(int)
+    return forecast
+
+# ─────────────────────────────────────────────────────────────────
+# PIPELINE PRINCIPAL
+# ─────────────────────────────────────────────────────────────────
+N_TRIALS   = 30   # trials de Optuna por producto para Prophet
+productos  = productos_clase_a["Nombre"].tolist()
+resultados = []
+predicciones_guardadas = {}  # dict: producto → datos para graficar
+for producto in productos:
+    print(f"\n{'='*60}\n{producto}")
+
+    # ── 1. Serie limpia ───────────────────────────────────────────
+    serie = preparar_serie_semanal(ventas_criticas, producto)
+    serie = serie[
+        ~((serie['ds'].dt.year == 2024) &
+          (serie['ds'].dt.month.isin([10, 11, 12])))
+    ].reset_index(drop=True)
+
+    # ── 2. Split 80/20 ────────────────────────────────────────────
+    corte     = int(len(serie) * 0.80)
+    train_ser = serie.iloc[:corte]
+    val_ser   = serie.iloc[corte:]
+    val_activo = val_ser[val_ser['y'] > 0]
+
+    # ── 3. Optuna → mejores params de Prophet ─────────────────────
+    def objective(trial):
+        params = dict(
+            changepoint_prior_scale = trial.suggest_float('changepoint_prior_scale', 0.001, 0.5,  log=True),
+            seasonality_prior_scale = trial.suggest_float('seasonality_prior_scale', 0.01,  20.0, log=True),
+            holidays_prior_scale    = trial.suggest_float('holidays_prior_scale',    1.0,   30.0),
+            seasonality_mode        = trial.suggest_categorical('seasonality_mode', ['additive', 'multiplicative']),
+            changepoint_range       = trial.suggest_float('changepoint_range', 0.70, 0.95),
+        )
+        try:
+            fc = entrenar_prophet_params(train_ser, params, periods_ahead=len(val_ser))
+            fc_val = fc[fc['ds'].isin(val_activo['ds'])][['ds', 'yhat']].copy()
+            merged = val_activo.merge(fc_val, on='ds')
+            if len(merged) == 0:
+                return 9999.0
+            return float(mean_absolute_error(merged['y'], merged['yhat']))
+        except Exception:
+            return 9999.0
+
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42)
+    )
+    study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
+    best_params = study.best_params
+
+    # ── 4. Reentrenar Prophet (params óptimos) sobre serie completa
+    forecast_full = entrenar_prophet_params(serie, best_params, periods_ahead=0)
+
+    forecast_hist = forecast_full[forecast_full['ds'].isin(serie['ds'])][
+        ['ds', 'yhat', 'yhat_lower', 'yhat_upper']
+    ].copy()
+
+    df_h = serie.merge(forecast_hist, on='ds', how='left')
+    df_h['residuo'] = df_h['y'] - df_h['yhat']
+
+    # Métricas Prophet out-of-sample (test)
+    df_val_merge = val_activo.merge(
+        forecast_hist[forecast_hist['ds'].isin(val_activo['ds'])], on='ds'
+    )
+    smape_p = smape_fn(df_val_merge['y'].values, df_val_merge['yhat'].values) if len(df_val_merge) else np.nan
+    mae_p   = mean_absolute_error(df_val_merge['y'], df_val_merge['yhat'])    if len(df_val_merge) else np.nan
+
+    # ── 5. Features para XGBoost ──────────────────────────────────
+    df_feat = crear_features(df_h[['ds', 'y']], vacaciones)
+    df_feat = df_feat.merge(
+        df_h[['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'residuo']],
+        on='ds', how='left'
+    )
+    df_modelo = df_feat.dropna(subset=FEATURES_HIBRIDO).copy()
+
+    if len(df_modelo) < 20:
+        print(f"  [SKIP XGB] muy pocas semanas ({len(df_modelo)})")
+        resultados.append({
+            'Producto': producto,
+            'N_semanas': len(serie),
+            'SMAPE_Prophet': round(smape_p, 3), 'MAE_Prophet': round(mae_p, 1),
+            'SMAPE_Hibrido': np.nan,             'MAE_Hibrido': np.nan,
+            'Delta_SMAPE': np.nan,               'Delta_MAE': np.nan,
+            'cp_scale': round(best_params['changepoint_prior_scale'], 4),
+            'seas_mode': best_params['seasonality_mode'],
+        })
+        continue
+
+    corte_m  = int(len(df_modelo) * 0.80)
+    train_h  = df_modelo.iloc[:corte_m]
+    test_h   = df_modelo.iloc[corte_m:]
+    test_act = test_h[test_h['y'] > 0]
+
+    # ── 6. Optuna → mejores params de XGBoost ────────────────────
+    X_opt   = train_h[FEATURES_HIBRIDO].values
+    y_res   = (train_h['y'] - train_h['yhat']).values
+    y_real  = train_h['y'].values
+    yhat_tr = train_h['yhat'].values
+
+    def objective_xgb(trial):
+        params_xgb = dict(
+            n_estimators      = trial.suggest_int  ('n_estimators',      100, 600),
+            learning_rate     = trial.suggest_float('learning_rate',     0.01, 0.25, log=True),
+            max_depth         = trial.suggest_int  ('max_depth',         2, 7),
+            subsample         = trial.suggest_float('subsample',         0.5, 1.0),
+            colsample_bytree  = trial.suggest_float('colsample_bytree',  0.5, 1.0),
+            min_child_weight  = trial.suggest_int  ('min_child_weight',  1, 15),
+            reg_alpha         = trial.suggest_float('reg_alpha',         0.0, 2.0),
+            reg_lambda        = trial.suggest_float('reg_lambda',        0.5, 5.0),
+            random_state=42, n_jobs=-1, verbosity=0
+        )
+        from sklearn.model_selection import TimeSeriesSplit
+        tscv = TimeSeriesSplit(n_splits=3)
+        fold_maes = []
+        for tr_idx, val_idx in tscv.split(X_opt):
+            m = XGBRegressor(**params_xgb)
+            m.fit(X_opt[tr_idx], y_res[tr_idx], verbose=False)
+            pred = (yhat_tr[val_idx] + m.predict(X_opt[val_idx])).clip(0)
+            fold_maes.append(mean_absolute_error(y_real[val_idx], pred))
+        return float(np.mean(fold_maes))
+
+    study_xgb = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42)
+    )
+    study_xgb.optimize(objective_xgb, n_trials=N_TRIALS, show_progress_bar=False)
+    best_xgb = study_xgb.best_params
+
+    # ── 7. Entrenar XGBoost con mejores params ────────────────────
+    xgb_m = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
+    xgb_m.fit(train_h[FEATURES_HIBRIDO], train_h['residuo'])
+
+    correccion   = xgb_m.predict(test_act[FEATURES_HIBRIDO])
+    pred_hibrida = (test_act['yhat'] + correccion).clip(0)
+
+    smape_h = smape_fn(test_act['y'].values, pred_hibrida)
+    mae_h   = mean_absolute_error(test_act['y'], pred_hibrida)
+
+    resultados.append({
+        'Producto':      producto,
+        'N_semanas':     len(serie),
+        'N_test':        len(test_act),
+        'SMAPE_Prophet': round(smape_p, 3),
+        'MAE_Prophet':   round(mae_p, 1),
+        'SMAPE_Hibrido': round(smape_h, 3),
+        'MAE_Hibrido':   round(mae_h, 1),
+        'Delta_SMAPE':   round(smape_p - smape_h, 3),   # positivo = XGB ganó
+        'Delta_MAE':     round(mae_p   - mae_h,   1),
+        'cp_scale':      round(best_params['changepoint_prior_scale'], 4),
+        'seas_mode':     best_params['seasonality_mode'],
+    })
+
+    ganador = "XGB mejor" if smape_h < smape_p else "Prophet mejor"
+    # Guardar para graficar después
+    predicciones_guardadas[producto] = {
+        'serie':         serie,
+        'forecast_hist': forecast_hist,
+        'test_ds':       test_act['ds'].values,
+        'y_real':        test_act['y'].values,
+        'y_prophet':     test_act['yhat'].values,
+        'y_hibrido':     pred_hibrida,
+        'corte_ds':      test_act['ds'].iloc[0],
+    }
+    print(f"  Prophet SMAPE={smape_p:.3f} MAE={mae_p:.1f} | Híbrido SMAPE={smape_h:.3f} MAE={mae_h:.1f} → {ganador}")
+    
+
+# ─────────────────────────────────────────────────────────────────
+# RESUMEN FINAL
+# ─────────────────────────────────────────────────────────────────
+df_resumen = pd.DataFrame(resultados).sort_values('SMAPE_Hibrido').reset_index(drop=True)
+
+print("\n\n── Resumen final ──────────────────────────────────────────────────────────────────")
+print(df_resumen.to_string(index=False))
+
+print("\n── Promedios ──────────────────────────────────────────────────────────────────────")
+cols_num = ['SMAPE_Prophet', 'MAE_Prophet', 'SMAPE_Hibrido', 'MAE_Hibrido', 'Delta_SMAPE', 'Delta_MAE']
+print(df_resumen[cols_num].mean().round(3).to_string())
