@@ -132,8 +132,10 @@ def crear_features(serie: pd.DataFrame, vacaciones: pd.DataFrame) -> pd.DataFram
     df["lag_1_clean"] = df.apply(_lag_clean, axis=1)
 
     # Garantia: todas las columnas objetivo existen (rellenar con 0 si alguna vacacion no aparece)
+    # EXCEPTO las de Prophet (yhat*) que se mergean despues.
+    columnas_prophet = {"yhat", "yhat_lower", "yhat_upper"}
     for col in FEATURES_MODELO:
-        if col not in df.columns:
+        if col not in df.columns and col not in columnas_prophet:
             df[col] = 0
 
     return df

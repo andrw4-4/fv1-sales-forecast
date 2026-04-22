@@ -210,46 +210,90 @@ def pipeline_producto(ventas, producto, vacaciones,
     modelo_final = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
     modelo_final.fit(df_modelo[FEATURES_MODELO], df_modelo["y"] - df_modelo["yhat"])
 
-    # ── 8. Predecir proxima semana
+    # ── 8. Predecir proximas N semanas (con prophet + correccion xgb + confianza)
+    horizonte = 4
+    # Prophet con horizonte mayor (reentrenar si es necesario)
+    _, forecast_h = entrenar_prophet(serie, vacaciones, best_prophet, periods_ahead=horizonte + 2)
+
     proxima_semana = (serie["ds"].max() + pd.Timedelta(weeks=1)).normalize()
-    # alinear al lunes
     proxima_semana = proxima_semana - pd.Timedelta(days=proxima_semana.weekday())
 
-    serie_extendida = expandir_calendario(serie, semanas_adicionales=1)
+    # Estimar std de residuos del walk-forward para intervalos de confianza
+    residuos_test = wf["reales"] - wf["predicciones"]
+    std_residual = float(np.std(residuos_test)) if len(residuos_test) > 1 else 0.0
+
+    # Construir serie extendida con H semanas adicionales para calcular features
+    serie_extendida = expandir_calendario(serie, semanas_adicionales=horizonte)
     feat_ext = crear_features(serie_extendida, vacaciones)
     feat_ext = feat_ext.merge(
-        forecast_full[["ds", "yhat", "yhat_lower", "yhat_upper"]],
-        on="ds", how="left"
+        forecast_h[["ds", "yhat", "yhat_lower", "yhat_upper"]],
+        on="ds", how="left",
     )
-    fila_prox = feat_ext[feat_ext["ds"] == proxima_semana]
-    if fila_prox.empty:
-        # fallback: ultima fila con yhat
-        fila_prox = feat_ext.dropna(subset=["yhat"]).tail(1)
-        proxima_semana = fila_prox["ds"].iloc[0] if not fila_prox.empty else proxima_semana
 
-    # Rellenar NaN en features con 0 (para la fila futura algunos lags no existen)
-    for col in FEATURES_MODELO:
-        if col not in fila_prox.columns:
-            fila_prox = fila_prox.assign(**{col: 0})
-    fila_prox = fila_prox[FEATURES_MODELO].fillna(0)
+    # Para cada semana futura, predecir de forma iterativa (usar predicciones previas como lag)
+    predicciones_futuras = []
+    y_historia = list(serie["y"].values)  # valores reales hasta la ultima semana
+    for h in range(1, horizonte + 1):
+        fecha_h = proxima_semana + pd.Timedelta(weeks=h - 1)
+        fila = feat_ext[feat_ext["ds"] == fecha_h].copy()
+        if fila.empty:
+            continue
+        # Rellenar lags con la historia extendida (real + predicciones previas)
+        if len(y_historia) >= 1:
+            fila["lag_1"] = y_historia[-1]
+        if len(y_historia) >= 2:
+            fila["lag_2"] = y_historia[-2]
+        if len(y_historia) >= 4:
+            fila["lag_4"] = y_historia[-4]
+        if len(y_historia) >= 4:
+            fila["rolling_4"] = float(np.mean(y_historia[-4:]))
+        if len(y_historia) >= 8:
+            fila["rolling_8"] = float(np.mean(y_historia[-8:]))
+        fila["lag_1_clean"] = fila["lag_1"]
 
-    if len(fila_prox) > 0:
-        yhat_prox = float(fila_prox["yhat"].iloc[0])
-        residuo_prox = float(modelo_final.predict(fila_prox.values)[0])
-        prediccion = max(0.0, yhat_prox + residuo_prox)
-    else:
-        prediccion = 0.0
-        yhat_prox = 0.0
+        for col in FEATURES_MODELO:
+            if col not in fila.columns:
+                fila[col] = 0
+        fila_X = fila[FEATURES_MODELO].fillna(0)
+
+        yhat_h = float(fila_X["yhat"].iloc[0])
+        yhat_lower_h = float(fila["yhat_lower"].iloc[0]) if "yhat_lower" in fila.columns else yhat_h * 0.8
+        yhat_upper_h = float(fila["yhat_upper"].iloc[0]) if "yhat_upper" in fila.columns else yhat_h * 1.2
+        residuo_h = float(modelo_final.predict(fila_X.values)[0])
+        prediccion_h = max(0.0, yhat_h + residuo_h)
+
+        # Intervalo de confianza: amplia con sqrt(h) (errores compuestos)
+        # Usa tanto std de residuos como el rango Prophet
+        ancho_h = std_residual * np.sqrt(h) * 1.96  # ~95%
+        rango_prophet = max(0, yhat_upper_h - yhat_lower_h) / 2
+        ancho_total = max(ancho_h, rango_prophet)
+
+        # "Probabilidad" o confianza: arbitraria pero intuitiva.
+        # Decae con h: 1 sem ~85%, 2 sem ~70%, 3 sem ~55%, 4 sem ~45%
+        confianza_pct = max(20, 95 - h * 13)
+
+        predicciones_futuras.append({
+            "semana_offset": h,
+            "fecha": fecha_h,
+            "prediccion": round(prediccion_h, 1),
+            "prediccion_lower": round(max(0, prediccion_h - ancho_total), 1),
+            "prediccion_upper": round(prediccion_h + ancho_total, 1),
+            "prophet_solo": round(yhat_h, 1),
+            "confianza_pct": confianza_pct,
+        })
+        y_historia.append(prediccion_h)  # para el siguiente lag
 
     return {
         "producto": producto,
         "n_semanas": len(serie),
         "fecha_proxima_semana": proxima_semana,
-        "prediccion_proxima_semana": round(prediccion, 1),
-        "prophet_proxima_semana": round(yhat_prox, 1),
+        "prediccion_proxima_semana": predicciones_futuras[0]["prediccion"] if predicciones_futuras else 0.0,
+        "prophet_proxima_semana": predicciones_futuras[0]["prophet_solo"] if predicciones_futuras else 0.0,
+        "predicciones_4_semanas": predicciones_futuras,
         "mae_test_walkforward": round(wf["mae"], 2),
         "mae_test_prophet_solo": round(mae_prophet, 2),
         "mejora_mae": round(mae_prophet - wf["mae"], 2),
+        "std_residual_test": round(std_residual, 2),
         "best_prophet_params": best_prophet,
         "best_xgb_params": best_xgb,
         "historial_test": pd.DataFrame({
