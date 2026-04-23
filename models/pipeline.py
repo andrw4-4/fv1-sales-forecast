@@ -300,5 +300,6 @@ def pipeline_producto(ventas, producto, vacaciones,
             "ds": wf["fechas"],
             "real": wf["reales"],
             "prediccion": wf["predicciones"],
+            "prophet": list(test_slice["yhat"].values),
         }),
     }

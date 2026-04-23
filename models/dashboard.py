@@ -772,30 +772,30 @@ with tab_precision:
 
         # ── Métricas
         mae_total = df_sel["error_abs"].mean()
-        mae_ult4 = df_sel.sort_values("ds").tail(4 * (1 if plato_prec != "Todos" else len(df_hist["producto"].unique())))["error_abs"].mean()
+        n_tail = 4 if plato_prec != "Todos" else 4 * df_hist["producto"].nunique()
+        mae_ult4 = df_sel.sort_values("ds").tail(n_tail)["error_abs"].mean()
         pct_bien = (df_sel["error_abs"] <= mae_total).mean() * 100
 
         k1, k2, k3 = st.columns(3)
-        k1.metric("MAE histórico (test)", f"{mae_total:.1f} unidades",
-                  help="Error absoluto medio en el período de evaluación walk-forward")
-        k2.metric("MAE últimas 4 semanas de test", f"{mae_ult4:.1f} unidades",
-                  help="Error en las últimas 4 semanas del período de evaluación")
-        k3.metric("Semanas dentro del MAE", f"{pct_bien:.0f}%",
-                  help="% de semanas donde el error fue ≤ MAE promedio")
+        k1.metric("MAE histórico (test)", f"{mae_total:.1f} unidades")
+        k2.metric("MAE últimas 4 semanas test", f"{mae_ult4:.1f} unidades")
+        k3.metric("Semanas dentro del MAE", f"{pct_bien:.0f}%")
 
         st.markdown("---")
 
         # ── Datos agregados para gráficas
+        tiene_prophet = "prophet" in df_hist.columns
         if plato_prec == "Todos":
-            df_agg = (df_sel.groupby("ds")
-                      .agg(real=("real", "sum"),
-                           prediccion=("prediccion", "sum"),
-                           error_abs=("error_abs", "sum"))
-                      .reset_index().sort_values("ds"))
+            agg_dict = dict(real=("real", "sum"),
+                            prediccion=("prediccion", "sum"),
+                            error_abs=("error_abs", "sum"))
+            if tiene_prophet:
+                agg_dict["prophet"] = ("prophet", "sum")
+            df_agg = df_sel.groupby("ds").agg(**agg_dict).reset_index().sort_values("ds")
         else:
             df_agg = df_sel.sort_values("ds").reset_index(drop=True)
 
-        # ── Gráfico real vs predicho
+        # ── Gráfico real vs predicho (+ prophet si está disponible)
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=df_agg["ds"], y=df_agg["real"],
@@ -803,18 +803,20 @@ with tab_precision:
             line=dict(color=VERDE, width=2.5),
             marker=dict(size=7, color=VERDE),
         ))
+        if "prophet" in df_agg.columns:
+            fig.add_trace(go.Scatter(
+                x=df_agg["ds"], y=df_agg["prophet"],
+                mode="lines+markers", name="Prophet solo",
+                line=dict(color=GRIS_SUAVE, width=1.8, dash="dot"),
+                marker=dict(size=5, color=GRIS_SUAVE),
+            ))
         fig.add_trace(go.Scatter(
             x=df_agg["ds"], y=df_agg["prediccion"],
-            mode="lines+markers", name="Predicho",
+            mode="lines+markers", name="Híbrido (Prophet+XGB)",
             line=dict(color=AMARILLO, width=2.5, dash="dash"),
             marker=dict(size=7, symbol="diamond", color=AMARILLO,
                         line=dict(color=MOSTAZA, width=1.5)),
         ))
-        titulo_graf = (
-            f"Real vs Predicho — {plato_sel if plato_prec != 'Todos' else 'Todos los productos'}"
-            if "plato_sel" in dir() else
-            f"Real vs Predicho — {plato_prec}"
-        )
         fig.update_layout(
             height=380,
             title=f"Real vs Predicho — {plato_prec}",
