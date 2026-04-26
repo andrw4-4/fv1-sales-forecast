@@ -118,9 +118,8 @@ def optimizar_xgboost(df_train, features, n_trials=30):
 
 
 def walk_forward_test(df_modelo, corte_test, features, xgb_params):
-    """Re-entrena para cada semana de test y predice esa semana (evaluacion realista)."""
     from xgboost import XGBRegressor
-    from sklearn.metrics import mean_absolute_error
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
 
     reales, preds, fechas = [], [], []
     n = len(df_modelo)
@@ -137,10 +136,20 @@ def walk_forward_test(df_modelo, corte_test, features, xgb_params):
 
     reales = np.array(reales)
     preds = np.array(preds)
+
     mae = mean_absolute_error(reales, preds)
+    rmse = np.sqrt(mean_squared_error(reales, preds))
+
+    mask = reales != 0
+    mape = np.mean(np.abs((reales[mask] - preds[mask]) / reales[mask])) * 100 if mask.any() else 0.0
+    smape = (2 * np.abs(reales - preds) / (np.abs(reales) + np.abs(preds) + 1e-8)).mean() * 100
+    sesgo = np.mean(preds - reales)
+
     return {
-        "fechas": fechas, "reales": reales, "predicciones": preds, "mae": mae,
+        "fechas": fechas, "reales": reales, "predicciones": preds,
+        "mae": mae, "rmse": rmse, "mape": mape, "smape": smape, "sesgo": sesgo
     }
+
 
 
 # ───────────────────────────────────────────────────────────────
@@ -197,18 +206,33 @@ def pipeline_producto(ventas, producto, vacaciones,
     train_h = df_modelo.iloc[:corte_test]
     best_xgb = optimizar_xgboost(train_h, FEATURES_MODELO, n_trials=n_trials_xgb)
 
-    # ── 6. Walk-forward en test
+        # ── 6. Walk-forward en test
     wf = walk_forward_test(df_modelo, corte_test, FEATURES_MODELO, best_xgb)
 
     # Baseline Prophet en test (para comparar)
-    from sklearn.metrics import mean_absolute_error
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
     test_slice = df_modelo.iloc[corte_test:]
-    mae_prophet = mean_absolute_error(test_slice["y"], test_slice["yhat"])
+    y_test_real = test_slice["y"].values
+    prophet_preds = np.clip(test_slice["yhat"].values, 0, None)
 
-    # ── 7. Reentrenar con TODOS los datos
+    mae_prophet = mean_absolute_error(y_test_real, prophet_preds)
+    rmse_prophet = np.sqrt(mean_squared_error(y_test_real, prophet_preds))
+
+    mask = y_test_real != 0
+    mape_prophet = np.mean(np.abs((y_test_real[mask] - prophet_preds[mask]) / y_test_real[mask])) * 100 if mask.any() else 0.0
+    smape_prophet = (2 * np.abs(y_test_real - prophet_preds) / (np.abs(y_test_real) + np.abs(prophet_preds) + 1e-8)).mean() * 100
+    sesgo_prophet = np.mean(prophet_preds - y_test_real)
+
+    hibrido_gano = wf["mae"] < mae_prophet
+    modelo_usado = "Híbrido" if hibrido_gano else "Prophet"
+
+    # ── 7. Reentrenar con TODOS los datos (si hibrido gano)
     from xgboost import XGBRegressor
-    modelo_final = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
-    modelo_final.fit(df_modelo[FEATURES_MODELO], df_modelo["y"] - df_modelo["yhat"])
+    if hibrido_gano:
+        modelo_final = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
+        modelo_final.fit(df_modelo[FEATURES_MODELO], df_modelo["y"] - df_modelo["yhat"])
+    else:
+        modelo_final = None
 
     # ── 8. Predecir proximas N semanas (con prophet + correccion xgb + confianza)
     horizonte = 4
@@ -259,7 +283,7 @@ def pipeline_producto(ventas, producto, vacaciones,
         yhat_h = float(fila_X["yhat"].iloc[0])
         yhat_lower_h = float(fila["yhat_lower"].iloc[0]) if "yhat_lower" in fila.columns else yhat_h * 0.8
         yhat_upper_h = float(fila["yhat_upper"].iloc[0]) if "yhat_upper" in fila.columns else yhat_h * 1.2
-        residuo_h = float(modelo_final.predict(fila_X.values)[0])
+        residuo_h = float(modelo_final.predict(fila_X.values)[0]) if modelo_final is not None else 0.0
         prediccion_h = max(0.0, yhat_h + residuo_h)
 
         # Intervalo de confianza: amplia con sqrt(h) (errores compuestos)
@@ -290,9 +314,18 @@ def pipeline_producto(ventas, producto, vacaciones,
         "prediccion_proxima_semana": predicciones_futuras[0]["prediccion"] if predicciones_futuras else 0.0,
         "prophet_proxima_semana": predicciones_futuras[0]["prophet_solo"] if predicciones_futuras else 0.0,
         "predicciones_4_semanas": predicciones_futuras,
-        "mae_test_walkforward": round(wf["mae"], 2),
-        "mae_test_prophet_solo": round(mae_prophet, 2),
+        "modelo_usado": modelo_usado,
+        "mae_hibrido": round(wf["mae"], 2),
+        "mae_prophet": round(mae_prophet, 2),
         "mejora_mae": round(mae_prophet - wf["mae"], 2),
+        "rmse_hibrido": round(wf["rmse"], 2),
+        "rmse_prophet": round(rmse_prophet, 2),
+        "mape_hibrido": round(wf["mape"], 2),
+        "mape_prophet": round(mape_prophet, 2),
+        "smape_hibrido": round(wf["smape"], 2),
+        "smape_prophet": round(smape_prophet, 2),
+        "sesgo_hibrido": round(wf["sesgo"], 2),
+        "sesgo_prophet": round(sesgo_prophet, 2),
         "std_residual_test": round(std_residual, 2),
         "best_prophet_params": best_prophet,
         "best_xgb_params": best_xgb,

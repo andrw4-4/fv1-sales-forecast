@@ -98,9 +98,9 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
                 print(f"  SKIP: {out['error']}")
                 continue
             dur = time.time() - t0
-            print(f"  MAE walk-forward: {out['mae_test_walkforward']:.2f}  "
-                  f"(Prophet solo: {out['mae_test_prophet_solo']:.2f})  "
-                  f"[+{out['mejora_mae']:.2f}]  "
+            print(f"  MAE Híbrido: {out['mae_hibrido']:.2f}  "
+                  f"(Prophet: {out['mae_prophet']:.2f})  "
+                  f"[Modelo: {out['modelo_usado']}]  "
                   f"Proxima semana: {out['prediccion_proxima_semana']}  "
                   f"[{dur:.0f}s]")
 
@@ -108,11 +108,20 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
                 "producto": out["producto"],
                 "n_semanas": out["n_semanas"],
                 "fecha_proxima_semana": out["fecha_proxima_semana"],
+                "modelo_usado": out["modelo_usado"],
                 "prediccion": out["prediccion_proxima_semana"],
                 "prophet_solo": out["prophet_proxima_semana"],
-                "mae_hibrido": out["mae_test_walkforward"],
-                "mae_prophet": out["mae_test_prophet_solo"],
+                "mae_hibrido": out["mae_hibrido"],
+                "mae_prophet": out["mae_prophet"],
                 "mejora_mae": out["mejora_mae"],
+                "rmse_hibrido": out["rmse_hibrido"],
+                "rmse_prophet": out["rmse_prophet"],
+                "mape_hibrido": out["mape_hibrido"],
+                "mape_prophet": out["mape_prophet"],
+                "smape_hibrido": out["smape_hibrido"],
+                "smape_prophet": out["smape_prophet"],
+                "sesgo_hibrido": out["sesgo_hibrido"],
+                "sesgo_prophet": out["sesgo_prophet"],
                 "std_residual": out.get("std_residual_test", 0),
             })
 
