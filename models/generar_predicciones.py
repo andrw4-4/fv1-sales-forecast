@@ -19,19 +19,59 @@ from models.pipeline import pipeline_producto
 from models.vacaciones import construir_vacaciones
 
 
-TOP_10_PRODUCTOS = [
-    "Arma tu plato Grande(21k)",
-    "Arma tu plato mediano (18k)",
-    "Sándwich Romano",
-    "Bowl Pollo tostada Mediana",
-    "Ensalada Chefsito Mediana",
-    "Sándwich Criollo",
-    "Bowl Lomo alto Mediana",
-    "Bowl Pasta Buona Mediana",
-    "Bowl Colombianito Mediana",
-    "Ensalada Pollo miel mostaza Mediana",
-]
 
+import re
+
+def limpiar_nombre_final(text):
+    if pd.isna(text): return text
+
+    patrones_a_remover = [
+        r'\(.*\)', r'\d+k', r'\d+oz',
+        r'Mediana', r'Mediano', r'Grande', r'Veggie',
+        r'400ml', r'600ml', r'250ml', r'450ml'
+    ]
+
+    temp_name = text
+    for patron in patrones_a_remover:
+        temp_name = re.sub(patron, '', temp_name, flags=re.IGNORECASE)
+
+    temp_name = " ".join(temp_name.split()).strip()
+
+    mapeo_especifico = {
+        'Hatsu amarillo': 'Hatsu Amarillo',
+        'Chocolate caliente': 'Chocolate Caliente',
+        'Pastel de pollo': 'Pastel de Pollo',
+        'Agua cristal': 'Agua sin Gas',
+        'Agua sin gas cristal': 'Agua sin Gas',
+        'Agua con gas cristal': 'Agua con Gas',
+        'Soda rosada': 'Soda Hatsu Rosada',
+        'Parfaits': 'Parfait Frutos Rojos',
+        'Parfaits frutos rojos': 'Parfait Frutos Rojos'
+    }
+
+    nombre_limpio = mapeo_especifico.get(temp_name, temp_name)
+    return nombre_limpio if len(nombre_limpio) > 0 else text
+
+def obtener_clase_A(ventas):
+    """Calcula el 80% de ventas y transacciones dinamicamente."""
+    info = ventas.groupby("Nombre").agg(
+        transacciones=("Cantidad", "count"),
+        plata_generada=("Total", "sum")
+    ).reset_index()
+
+    # Clase A Ventas
+    info = info.sort_values("plata_generada", ascending=False)
+    info["pct_plata"] = info["plata_generada"] / info["plata_generada"].sum()
+    info["pct_acum_plata"] = info["pct_plata"].cumsum()
+    clase_a_ventas = info[info["pct_acum_plata"] - info["pct_plata"] < 0.80]["Nombre"].tolist()
+
+    # Clase A Transacciones
+    info = info.sort_values("transacciones", ascending=False)
+    info["pct_trans"] = info["transacciones"] / info["transacciones"].sum()
+    info["pct_acum_trans"] = info["pct_trans"].cumsum()
+    clase_a_trans = info[info["pct_acum_trans"] - info["pct_trans"] < 0.80]["Nombre"].tolist()
+
+    return list(set(clase_a_ventas) & set(clase_a_trans))
 
 def cargar_ventas() -> pd.DataFrame:
     v = pd.read_csv(ROOT / "data" / "raw" / "ventas.csv",
@@ -43,7 +83,12 @@ def cargar_ventas() -> pd.DataFrame:
     v = v.dropna(subset=["Fecha"])
     v["Cantidad"] = pd.to_numeric(v["Cantidad"], errors="coerce").fillna(0)
     v["Precio"] = pd.to_numeric(v["Precio"], errors="coerce").fillna(0)
+    v["Total"] = pd.to_numeric(v["Total"], errors="coerce")
+    v["Total"] = v["Total"].fillna(v["Cantidad"] * v["Precio"])
+
+    v["Nombre"] = v["Nombre"].apply(limpiar_nombre_final)
     return v
+
 
 
 def calcular_precios(ventas: pd.DataFrame, productos: list[str]) -> pd.DataFrame:
@@ -68,16 +113,7 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
     vacaciones = construir_vacaciones()
     ventas = cargar_ventas()
 
-    # Combinar las dos variantes de "Arma tu plato" en una sola serie
-    ventas_combinadas = ventas.copy()
-    mapa_arma = {
-        "Arma tu plato Grande(21k)": "Arma tu plato (combinado)",
-        "Arma tu plato mediano (18k)": "Arma tu plato (combinado)",
-    }
-    ventas_combinadas["Nombre"] = ventas_combinadas["Nombre"].replace(mapa_arma)
-
-    productos_a_correr = [p for p in TOP_10_PRODUCTOS if p not in mapa_arma]
-    productos_a_correr.insert(0, "Arma tu plato (combinado)")
+    productos_a_correr = obtener_clase_A(ventas)
 
     resumen = []
     preds_4sem = []
@@ -88,7 +124,7 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
         t0 = time.time()
         print(f"\n[{i}/{len(productos_a_correr)}] {producto}")
         try:
-            ventas_p = ventas_combinadas if producto == "Arma tu plato (combinado)" else ventas
+            ventas_p = ventas
             out = pipeline_producto(
                 ventas_p, producto, vacaciones,
                 n_trials_prophet=n_trials_prophet,
@@ -98,7 +134,7 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
                 print(f"  SKIP: {out['error']}")
                 continue
             dur = time.time() - t0
-            print(f"  MAE walk-forward: {out['mae_test_walkforward']:.2f}  "
+            print(f"  MAE Hibrido: {out['mae_test_walkforward']:.2f} | SMAPE: {out.get('smape_hibrido', 0):.3f} "
                   f"(Prophet solo: {out['mae_test_prophet_solo']:.2f})  "
                   f"[+{out['mejora_mae']:.2f}]  "
                   f"Proxima semana: {out['prediccion_proxima_semana']}  "
@@ -111,6 +147,7 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
                 "prediccion": out["prediccion_proxima_semana"],
                 "prophet_solo": out["prophet_proxima_semana"],
                 "mae_hibrido": out["mae_test_walkforward"],
+                "smape_hibrido": out.get("smape_hibrido", 0),
                 "mae_prophet": out["mae_test_prophet_solo"],
                 "mejora_mae": out["mejora_mae"],
                 "std_residual": out.get("std_residual_test", 0),
@@ -137,19 +174,12 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
 
     # ── Precios unitarios (para estimar ingresos)
     productos_para_precio = [r["producto"] for r in resumen]
-    # Para la serie combinada, usar el promedio de las dos originales
     df_precios = []
     for p in productos_para_precio:
-        if p == "Arma tu plato (combinado)":
-            sub = ventas[ventas["Nombre"].isin(list(mapa_arma.keys()))]
-            precio = ((sub["Precio"] * sub["Cantidad"]).sum()
-                      / max(sub["Cantidad"].sum(), 1)) if len(sub) else 0
-            df_precios.append({"producto": p, "precio_unitario": float(round(precio, 0))})
-        else:
-            sub = ventas[ventas["Nombre"] == p]
-            precio = ((sub["Precio"] * sub["Cantidad"]).sum()
-                      / max(sub["Cantidad"].sum(), 1)) if len(sub) else 0
-            df_precios.append({"producto": p, "precio_unitario": float(round(precio, 0))})
+        sub = ventas[ventas["Nombre"] == p]
+        precio = ((sub["Precio"] * sub["Cantidad"]).sum()
+                  / max(sub["Cantidad"].sum(), 1)) if len(sub) else 0
+        df_precios.append({"producto": p, "precio_unitario": float(round(precio, 0))})
     df_precios = pd.DataFrame(df_precios)
 
     # ── Guardar

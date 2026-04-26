@@ -7,27 +7,14 @@ from models.vacaciones import HITOS_INICIO
 
 
 FEATURES_MODELO = [
-    # Prophet
-    "yhat", "yhat_lower", "yhat_upper",
-    # Calendario generico
-    "mes", "semana_año", "trimestre",
-    "mes_sin", "mes_cos", "semana_sin", "semana_cos",
-    # Calendario academico Uniandes
-    "semana_academica",
-    "pre_evento",
-    "inicio_parciales_1", "fin_parciales_1",
-    "inicio_parciales_2", "fin_parciales_2",
-    "vuelta_a_clases", "post_vacaciones",
-    # Historia reciente
-    "lag_1", "lag_2", "lag_4",
-    "rolling_4", "rolling_8",
-    "lag_1_clean",
-    # Vacaciones / eventos
-    "hol_semana_santa", "hol_semana_receso_verano",
-    "hol_examenes_finales", "hol_vacaciones_verano",
-    "hol_semana_receso_invierno", "hol_vacaciones_invierno",
-    "hol_cierre_oct_dic_2024", "hol_induccion_pregrado",
-    "semanas_antes_verano",
+    'yhat', 'yhat_lower', 'yhat_upper',
+    'mes', 'semana_año', 'trimestre',
+    'lag_1', 'lag_2', 'lag_4',
+    'rolling_4', 'rolling_8',
+    'hol_semana_santa', 'hol_semana_receso_verano',
+    'hol_examenes_finales', 'hol_vacaciones_verano',
+    'hol_semana_receso_invierno', 'hol_vacaciones_invierno',
+    'hol_cierre_oct_dic_2024', 'semanas_antes_verano'
 ]
 
 

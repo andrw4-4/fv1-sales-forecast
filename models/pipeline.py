@@ -47,6 +47,7 @@ def entrenar_prophet(serie, vacaciones, params, periods_ahead=0):
 
 def optimizar_prophet(train_ser, val_ser, vacaciones, n_trials=20):
     import optuna
+    from sklearn.metrics import mean_absolute_error
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     val_activo = val_ser[val_ser["y"] > 0]
 
@@ -64,7 +65,7 @@ def optimizar_prophet(train_ser, val_ser, vacaciones, n_trials=20):
             merged = val_activo.merge(fc_val, on="ds")
             if len(merged) == 0:
                 return 9999.0
-            return float(np.mean(np.abs(merged["y"].values - merged["yhat"].values)))
+            return float(mean_absolute_error(merged["y"], merged["yhat"]))
         except Exception:
             return 9999.0
 
@@ -118,28 +119,38 @@ def optimizar_xgboost(df_train, features, n_trials=30):
 
 
 def walk_forward_test(df_modelo, corte_test, features, xgb_params):
-    """Re-entrena para cada semana de test y predice esa semana (evaluacion realista)."""
     from xgboost import XGBRegressor
     from sklearn.metrics import mean_absolute_error
+    import numpy as np
 
-    reales, preds, fechas = [], [], []
-    n = len(df_modelo)
-    for i in range(corte_test, n):
-        train_wf = df_modelo.iloc[:i]
-        target = df_modelo.iloc[[i]]
-        model = XGBRegressor(**xgb_params, random_state=42, n_jobs=-1, verbosity=0)
-        model.fit(train_wf[features], train_wf["y"] - train_wf["yhat"])
-        residuo_pred = model.predict(target[features])
-        pred_final = np.clip(target["yhat"].values + residuo_pred, 0, None)
-        reales.append(target["y"].values[0])
-        preds.append(pred_final[0])
-        fechas.append(target["ds"].values[0])
+    # En lugar de walk-forward estricto, la notebook usaba XGBRegressor.fit en train y predict en todo test_act.
+    # Pero el usuario dice "seguir tal cual la celda", la celda entrena el modelo de XGBoost
+    # una sola vez en el split y lo corre en test_act.
+    train_h = df_modelo.iloc[:corte_test]
+    test_act = df_modelo.iloc[corte_test:]
+    test_act = test_act[test_act["y"] > 0]
 
-    reales = np.array(reales)
-    preds = np.array(preds)
-    mae = mean_absolute_error(reales, preds)
+    if len(test_act) == 0:
+        return {"fechas": [], "reales": [], "predicciones": [], "mae": 0.0, "smape": 0.0, "test_act_yhat": []}
+
+    modelo_final = XGBRegressor(**xgb_params, random_state=42, n_jobs=-1, verbosity=0)
+    modelo_final.fit(train_h[features], train_h["y"] - train_h["yhat"])
+
+    correccion = modelo_final.predict(test_act[features])
+    pred_hibrida = np.clip(test_act["yhat"].values + correccion, 0, None)
+
+    smape_fn = lambda y, yhat: (2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat) + 1e-8)).mean()
+
+    mae = mean_absolute_error(test_act["y"], pred_hibrida)
+    smape = smape_fn(test_act["y"].values, pred_hibrida)
+
     return {
-        "fechas": fechas, "reales": reales, "predicciones": preds, "mae": mae,
+        "fechas": test_act["ds"].tolist(),
+        "reales": test_act["y"].values,
+        "predicciones": pred_hibrida,
+        "mae": mae,
+        "smape": smape,
+        "test_act_yhat": test_act["yhat"].values
     }
 
 
@@ -291,6 +302,7 @@ def pipeline_producto(ventas, producto, vacaciones,
         "prophet_proxima_semana": predicciones_futuras[0]["prophet_solo"] if predicciones_futuras else 0.0,
         "predicciones_4_semanas": predicciones_futuras,
         "mae_test_walkforward": round(wf["mae"], 2),
+        "smape_hibrido": round(wf["smape"], 3),
         "mae_test_prophet_solo": round(mae_prophet, 2),
         "mejora_mae": round(mae_prophet - wf["mae"], 2),
         "std_residual_test": round(std_residual, 2),
@@ -300,6 +312,6 @@ def pipeline_producto(ventas, producto, vacaciones,
             "ds": wf["fechas"],
             "real": wf["reales"],
             "prediccion": wf["predicciones"],
-            "prophet": list(test_slice["yhat"].values),
+            "prophet": wf["test_act_yhat"],
         }),
     }
