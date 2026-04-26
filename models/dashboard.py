@@ -744,185 +744,89 @@ with tab_historico:
 # TAB: PRECISION DEL MODELO
 # ═══════════════════════════════════════════════════════════════════
 with tab_precision:
-    st.markdown("## 📉 Precisión del modelo")
+    st.markdown("## 📉 Precisión de los modelos por producto")
     st.markdown(
         f"<div class='caja-info'>"
-        f"Evaluación <b>walk-forward</b>: para cada semana del 20% final de datos históricos, "
-        f"el modelo se reentrenó con todo lo anterior y predijo esa semana. "
-        f"Esto refleja cómo rinde el modelo en condiciones reales."
+        f"Comparamos el rendimiento de <b>Prophet</b> (largo plazo) vs <b>Modelo Híbrido</b> (XGBoost). "
+        f"El sistema escoge automáticamente el modelo con el mejor MAE en validación (Walk-Forward). "
+        f"Aquí se muestran todas las métricas evaluadas (RMSE, MAPE, SMAPE)."
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    if preds["historial"] is None:
-        st.warning(
-            "⚠️ Aún no hay historial de evaluación. "
-            "Ejecuta `python -m models.generar_predicciones` desde la terminal."
-        )
+    if preds["resumen"] is None:
+        st.info("Genera las predicciones para ver las métricas.")
     else:
-        df_hist = preds["historial"].copy()
-        df_hist["ds"] = pd.to_datetime(df_hist["ds"])
-        df_hist["error_abs"] = (df_hist["real"] - df_hist["prediccion"]).abs()
+        df_res = preds["resumen"]
 
-        # ── Selector de producto
-        productos_hist = ["Todos"] + sorted(df_hist["producto"].unique())
-        plato_prec = st.selectbox("Producto", productos_hist, key="prec_prod")
+        col1, col2 = st.columns(2)
+        with col1:
+            mejores_hibrido = (df_res["modelo_usado"] == "Híbrido").sum()
+            st.metric("🏆 Platos donde ganó Híbrido", f"{mejores_hibrido} de {len(df_res)}")
+        with col2:
+            mejores_prophet = (df_res["modelo_usado"] == "Prophet").sum()
+            st.metric("🏆 Platos donde ganó Prophet", f"{mejores_prophet} de {len(df_res)}")
 
-        df_sel = df_hist if plato_prec == "Todos" else df_hist[df_hist["producto"] == plato_prec]
+        st.markdown("### 📊 Comparativa MAE (Error Absoluto Medio)")
 
-        # ── Métricas
-        mae_total = df_sel["error_abs"].mean()
-        n_tail = 4 if plato_prec != "Todos" else 4 * df_hist["producto"].nunique()
-        mae_ult4 = df_sel.sort_values("ds").tail(n_tail)["error_abs"].mean()
-        pct_bien = (df_sel["error_abs"] <= mae_total).mean() * 100
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric("MAE histórico (test)", f"{mae_total:.1f} unidades")
-        k2.metric("MAE últimas 4 semanas test", f"{mae_ult4:.1f} unidades")
-        k3.metric("Semanas dentro del MAE", f"{pct_bien:.0f}%")
-
-        st.markdown("---")
-
-        # ── Datos agregados para gráficas
-        tiene_prophet = "prophet" in df_hist.columns
-        if plato_prec == "Todos":
-            agg_dict = dict(real=("real", "sum"),
-                            prediccion=("prediccion", "sum"),
-                            error_abs=("error_abs", "sum"))
-            if tiene_prophet:
-                agg_dict["prophet"] = ("prophet", "sum")
-            df_agg = df_sel.groupby("ds").agg(**agg_dict).reset_index().sort_values("ds")
-        else:
-            df_agg = df_sel.sort_values("ds").reset_index(drop=True)
-
-        # ── Gráfico real vs predicho (+ prophet si está disponible)
+        # Grafico comparativo de MAE
+        df_res_sorted = df_res.sort_values("mae_hibrido")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df_agg["ds"], y=df_agg["real"],
-            mode="lines+markers", name="Real",
-            line=dict(color=VERDE, width=2.5),
-            marker=dict(size=7, color=VERDE),
+        fig.add_trace(go.Bar(
+            name="Prophet puro", x=df_res_sorted["producto"], y=df_res_sorted["mae_prophet"],
+            marker_color="#8F8C85"
         ))
-        if "prophet" in df_agg.columns:
-            fig.add_trace(go.Scatter(
-                x=df_agg["ds"], y=df_agg["prophet"],
-                mode="lines+markers", name="Prophet solo",
-                line=dict(color=GRIS_SUAVE, width=1.8, dash="dot"),
-                marker=dict(size=5, color=GRIS_SUAVE),
-            ))
-        fig.add_trace(go.Scatter(
-            x=df_agg["ds"], y=df_agg["prediccion"],
-            mode="lines+markers", name="Híbrido (Prophet+XGB)",
-            line=dict(color=AMARILLO, width=2.5, dash="dash"),
-            marker=dict(size=7, symbol="diamond", color=AMARILLO,
-                        line=dict(color=MOSTAZA, width=1.5)),
+        fig.add_trace(go.Bar(
+            name="Híbrido (Prophet+XGB)", x=df_res_sorted["producto"], y=df_res_sorted["mae_hibrido"],
+            marker_color=AMARILLO
         ))
+
+        # Add asterisks to the winner
+        winner_text = ["★" if row["modelo_usado"] == "Híbrido" else "" for _, row in df_res_sorted.iterrows()]
+        fig.add_trace(go.Scatter(
+            x=df_res_sorted["producto"], y=df_res_sorted["mae_hibrido"] + 1,
+            mode="text", text=winner_text, textposition="top center",
+            textfont=dict(color=VERDE_OSCURO, size=16),
+            showlegend=False, hoverinfo="none"
+        ))
+
         fig.update_layout(
-            height=380,
-            title=f"Real vs Predicho — {plato_prec}",
-            title_font=dict(color=VERDE_OSCURO),
-            plot_bgcolor=CREMA, paper_bgcolor=CREMA,
-            font=dict(color=CARBON),
-            margin=dict(t=50, b=40, l=60, r=20),
-            xaxis=dict(showgrid=False, title="Semana"),
-            yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
-            legend=dict(orientation="h", y=1.12, x=0),
-            hovermode="x unified",
+            barmode="group",
+            height=400, plot_bgcolor=CREMA, paper_bgcolor=CREMA,
+            title="MAE por producto (★ = Híbrido fue mejor)",
+            title_font=dict(color=VERDE_OSCURO), font=dict(color=CARBON),
+            legend=dict(orientation="h", y=1.1, x=0),
+            yaxis=dict(title="Unidades de error", showgrid=True, gridcolor="#E0DDD3"),
+            margin=dict(t=50, b=40, l=10, r=10),
         )
+        fig.update_xaxes(tickangle=-45)
         st.plotly_chart(fig, use_container_width=True)
 
-        # ── Error absoluto por semana
-        mae_linea = df_agg["error_abs"].mean()
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(
-            x=df_agg["ds"], y=df_agg["error_abs"],
-            marker_color=AMARILLO, name="Error absoluto",
-        ))
-        fig2.add_hline(
-            y=mae_linea, line_dash="dash", line_color=VERDE_OSCURO,
-            annotation_text=f"MAE: {mae_linea:.1f}",
-            annotation_position="top right",
-        )
-        fig2.update_layout(
-            height=250,
-            title="Error absoluto por semana",
-            title_font=dict(color=VERDE_OSCURO),
-            plot_bgcolor=CREMA, paper_bgcolor=CREMA,
-            font=dict(color=CARBON),
-            yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
-            xaxis=dict(showgrid=False),
-            margin=dict(t=40, b=40, l=60, r=20),
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("### 🧮 Tabla Completa de Métricas")
+        mostrar_cols = [
+            "producto", "modelo_usado",
+            "mae_prophet", "mae_hibrido", "mejora_mae",
+            "rmse_hibrido", "smape_hibrido", "sesgo_hibrido"
+        ]
 
-        # ── Tabla resumen por producto
-        st.markdown("### Precisión por producto")
-        resumen_prec = (
-            df_hist.groupby("producto")["error_abs"]
-            .agg(MAE="mean", Error_max="max", Error_mediano="median", Semanas="count")
-            .round(1).reset_index()
-            .sort_values("MAE")
-        )
-        resumen_prec.columns = ["Producto", "MAE (unidades)", "Error máx.", "Error mediano", "Semanas test"]
-        st.dataframe(resumen_prec, use_container_width=True, hide_index=True)
+        # Format table
+        tabla_metricas = df_res_sorted[mostrar_cols].copy()
+        for col in ["mae_prophet", "mae_hibrido", "mejora_mae", "rmse_hibrido", "sesgo_hibrido"]:
+            if col in tabla_metricas:
+                tabla_metricas[col] = tabla_metricas[col].apply(lambda x: f"{x:.1f}" if pd.notnull(x) else "-")
 
-        # ── Seguimiento predicciones futuras que ya pasaron
-        if preds["4sem"] is not None:
-            df_fut = preds["4sem"].copy()
-            df_fut["fecha"] = pd.to_datetime(df_fut["fecha"])
-            hoy = pd.Timestamp.today().normalize()
-            pasadas = df_fut[df_fut["fecha"] < hoy]
+        if "smape_hibrido" in tabla_metricas:
+            tabla_metricas["smape_hibrido"] = tabla_metricas["smape_hibrido"].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) else "-")
 
-            if not pasadas.empty:
-                st.markdown("---")
-                st.markdown("### 🆕 Seguimiento de predicciones en vivo")
-                st.markdown(
-                    f"<div class='caja-info'>"
-                    f"El modelo hizo {len(pasadas)} predicciones para fechas que ya transcurrieron. "
-                    f"Se comparan con las ventas reales registradas.</div>",
-                    unsafe_allow_html=True,
-                )
+        tabla_metricas.columns = [
+            "Plato", "Modelo Elegido",
+            "MAE Prophet", "MAE Híbrido", "Mejora MAE",
+            "RMSE Híbrido", "SMAPE Híbrido", "Sesgo Híbrido"
+        ]
 
-                # Alinear ventas reales por semana (lunes)
-                v_sem = ventas.copy()
-                v_sem["ds"] = v_sem["Fecha"].apply(
-                    lambda x: x - pd.Timedelta(days=x.weekday())
-                ).dt.normalize()
-                # Combinar las dos variantes de "Arma tu plato"
-                v_sem.loc[v_sem["Nombre"].isin(["Arma tu plato Grande(21k)",
-                                                 "Arma tu plato mediano (18k)"]),
-                          "Nombre"] = "Arma tu plato (combinado)"
-                v_sem_g = v_sem.groupby(["Nombre", "ds"])["Cantidad"].sum().reset_index()
+        st.dataframe(tabla_metricas, use_container_width=True, hide_index=True)
 
-                rows_seg = []
-                for _, r in pasadas.iterrows():
-                    real_val = v_sem_g.loc[
-                        (v_sem_g["Nombre"] == r["producto"]) &
-                        (v_sem_g["ds"] == r["fecha"]),
-                        "Cantidad"
-                    ].sum()
-                    rows_seg.append({
-                        "Producto": r["producto"],
-                        "Fecha": r["fecha"].strftime("%Y-%m-%d"),
-                        "Predicho": round(r["prediccion"], 1),
-                        "Real": int(real_val) if real_val > 0 else None,
-                        "Error": round(abs(real_val - r["prediccion"]), 1) if real_val > 0 else None,
-                    })
-
-                df_seg = pd.DataFrame(rows_seg)
-                con_real = df_seg[df_seg["Real"].notna()]
-
-                if not con_real.empty:
-                    mae_vivo = con_real["Error"].mean()
-                    st.metric("MAE predicciones en vivo", f"{mae_vivo:.1f} unidades")
-                    st.dataframe(con_real, use_container_width=True, hide_index=True)
-                else:
-                    st.info(
-                        "Las fechas predichas ya pasaron pero aún no hay ventas reales "
-                        "registradas en el CSV para esas semanas."
-                    )
-
-
+        st.info("💡 **RMSE** castiga errores grandes (picos). **SMAPE** mide error porcentual. **Sesgo** negativo significa que tiende a subestimar.")
 # ═══════════════════════════════════════════════════════════════════
 # TAB: PRODUCTOS
 # ═══════════════════════════════════════════════════════════════════
