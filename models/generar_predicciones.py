@@ -52,26 +52,42 @@ def limpiar_nombre_final(text):
     nombre_limpio = mapeo_especifico.get(temp_name, temp_name)
     return nombre_limpio if len(nombre_limpio) > 0 else text
 
+
 def obtener_clase_A(ventas):
     """Calcula el 80% de ventas y transacciones dinamicamente."""
+    # Filtrar solo 'Principal' y desde '2024-01-01' como en el notebook
+    ventas = ventas[
+        (ventas["Establecimiento"] == "Principal") &
+        (ventas["Fecha"] >= "2024-01-01")
+    ].copy()
+
     info = ventas.groupby("Nombre").agg(
         transacciones=("Cantidad", "count"),
+        cantidad_total=("Cantidad", "sum"),
         plata_generada=("Total", "sum")
     ).reset_index()
 
+    # 1. Filtro Estrella (Matriz BCG)
+    corte_x = info["cantidad_total"].median()
+    corte_y = info["plata_generada"].median()
+
+    info["estrella"] = (info["cantidad_total"] >= corte_x) & (info["plata_generada"] >= corte_y)
+    info = info[info["estrella"]].copy()
+
     # Clase A Ventas
-    info = info.sort_values("plata_generada", ascending=False)
-    info["pct_plata"] = info["plata_generada"] / info["plata_generada"].sum()
-    info["pct_acum_plata"] = info["pct_plata"].cumsum()
-    clase_a_ventas = info[info["pct_acum_plata"] - info["pct_plata"] < 0.80]["Nombre"].tolist()
+    info_v = info.sort_values("plata_generada", ascending=False).copy()
+    info_v["pct_plata"] = info_v["plata_generada"] / info_v["plata_generada"].sum()
+    info_v["pct_acum_plata"] = info_v["pct_plata"].cumsum()
+    clase_a_ventas = info_v[info_v["pct_acum_plata"] - info_v["pct_plata"] < 0.80]["Nombre"].tolist()
 
     # Clase A Transacciones
-    info = info.sort_values("transacciones", ascending=False)
-    info["pct_trans"] = info["transacciones"] / info["transacciones"].sum()
-    info["pct_acum_trans"] = info["pct_trans"].cumsum()
-    clase_a_trans = info[info["pct_acum_trans"] - info["pct_trans"] < 0.80]["Nombre"].tolist()
+    info_t = info.sort_values("transacciones", ascending=False).copy()
+    info_t["pct_trans"] = info_t["transacciones"] / info_t["transacciones"].sum()
+    info_t["pct_acum_trans"] = info_t["pct_trans"].cumsum()
+    clase_a_trans = info_t[info_t["pct_acum_trans"] - info_t["pct_trans"] < 0.80]["Nombre"].tolist()
 
     return list(set(clase_a_ventas) & set(clase_a_trans))
+
 
 def cargar_ventas() -> pd.DataFrame:
     v = pd.read_csv(ROOT / "data" / "raw" / "ventas.csv",
