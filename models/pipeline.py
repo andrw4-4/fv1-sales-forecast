@@ -139,7 +139,7 @@ def walk_forward_test(df_modelo, corte_test, features, xgb_params):
     correccion = modelo_final.predict(test_act[features])
     pred_hibrida = np.clip(test_act["yhat"].values + correccion, 0, None)
 
-    smape_fn = lambda y, yhat: (2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat) + 1e-8)).mean()
+    smape_fn = lambda y, yhat: (2 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat) + 1e-8)).mean() * 100
 
     mae = mean_absolute_error(test_act["y"], pred_hibrida)
     smape = smape_fn(test_act["y"].values, pred_hibrida)

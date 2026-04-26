@@ -150,7 +150,7 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
                 print(f"  SKIP: {out['error']}")
                 continue
             dur = time.time() - t0
-            print(f"  MAE Hibrido: {out['mae_test_walkforward']:.2f} | SMAPE: {out.get('smape_hibrido', 0):.3f} "
+            print(f"  MAE Hibrido: {out['mae_test_walkforward']:.2f} | SMAPE: {out.get('smape_hibrido', 0):.1f}% "
                   f"(Prophet solo: {out['mae_test_prophet_solo']:.2f})  "
                   f"[+{out['mejora_mae']:.2f}]  "
                   f"Proxima semana: {out['prediccion_proxima_semana']}  "
