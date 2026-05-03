@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 data/raw/*
 !data/raw/ventas.csv
+!data/raw/info_productos.csv
+!data/raw/compras.csv
 data/processed/
 models/*.pkl
 .env
