@@ -205,7 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-data/raw/
+data/raw/*
+!data/raw/ventas.csv
 data/processed/
 models/*.pkl
 .env
+.streamlit/secrets.toml

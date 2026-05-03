@@ -225,6 +225,15 @@ def main(n_trials_prophet: int = 20, n_trials_xgb: int = 30):
     print("\n── Precios unitarios ──")
     print(df_precios.to_string(index=False))
 
+    # ── Metadata (timestamp del último reentrenamiento)
+    import json
+    from datetime import datetime
+    metadata = {
+        "ultima_actualizacion": datetime.now().isoformat(timespec="seconds"),
+        "n_productos": len(resumen),
+    }
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     import argparse

@@ -312,6 +312,48 @@ with st.sidebar:
     estab = st.selectbox("Sede", estabs, label_visibility="collapsed")
 
     st.divider()
+
+    # ── Metadata del modelo
+    import json as _json
+    _meta_path = DATA_PRED / "metadata.json"
+    if _meta_path.exists():
+        try:
+            _meta = _json.loads(_meta_path.read_text())
+            _fecha_mod = _meta.get("ultima_actualizacion", "")[:16].replace("T", " ")
+            _n_prod = _meta.get("n_productos", "?")
+            st.markdown(f"**🤖 Modelo de producción**")
+            st.caption(f"Último reentrenamiento: **{_fecha_mod}**")
+            st.caption(f"Productos: {_n_prod}")
+        except Exception:
+            pass
+    else:
+        st.caption("⚠️ Sin predicciones generadas aún")
+
+    st.divider()
+
+    # ── Botón de reentrenamiento
+    st.markdown("**🔄 Actualizar predicciones**")
+    st.caption("Rereentrena el modelo con todos los datos disponibles (~20-30 min).")
+    if st.button("Regenerar predicciones", use_container_width=True):
+        import subprocess as _sp
+        import sys as _sys
+        with st.spinner("Ejecutando pipeline... esto puede tomar varios minutos."):
+            try:
+                _result = _sp.run(
+                    [_sys.executable, "-m", "models.generar_predicciones"],
+                    cwd=str(ROOT), capture_output=True, text=True, timeout=3600,
+                )
+                if _result.returncode == 0:
+                    st.success("Predicciones regeneradas correctamente. Recarga la página para ver los cambios.")
+                    st.cache_data.clear()
+                else:
+                    st.error(f"Error al generar predicciones:\n{_result.stderr[-500:]}")
+            except _sp.TimeoutExpired:
+                st.error("El proceso tardó más de 1 hora y fue cancelado.")
+            except Exception as _e:
+                st.error(f"No se pudo ejecutar el pipeline: {_e}")
+
+    st.divider()
     st.caption(f"Datos desde {meses[0]} hasta {meses[-1]}")
     st.caption("iPPO · PICE · Uniandes")
 
@@ -357,10 +399,18 @@ tab_pred, tab_resumen, tab_historico, tab_precision, tab_productos, tab_patrones
 # ═══════════════════════════════════════════════════════════════════
 with tab_pred:
     st.markdown("## 🔮 Predicción de demanda — próximas 4 semanas")
+    _badge_fecha = ""
+    if _meta_path.exists():
+        try:
+            _m = _json.loads(_meta_path.read_text())
+            _badge_fecha = _m.get("ultima_actualizacion", "")[:16].replace("T", " ")
+        except Exception:
+            pass
+    _badge_txt = (f"Generado el {_badge_fecha} · " if _badge_fecha else "")
     st.markdown(
         f"<div class='caja-info'>"
-        f"Modelo híbrido <b>Prophet + XGBoost</b>. Entre más lejos en el futuro, "
-        f"<b>menor es la probabilidad</b> de que el valor exacto se cumpla "
+        f"{_badge_txt}Modelo híbrido <b>Prophet + XGBoost</b> reentrenado con <b>todos los datos históricos disponibles</b>. "
+        f"Entre más lejos en el futuro, <b>menor es la probabilidad</b> de que el valor exacto se cumpla "
         f"(el rango de confianza se ensancha)."
         f"</div>",
         unsafe_allow_html=True,
@@ -745,128 +795,26 @@ with tab_historico:
 # ═══════════════════════════════════════════════════════════════════
 with tab_precision:
     st.markdown("## 📉 Precisión del modelo")
-    st.markdown(
-        f"<div class='caja-info'>"
-        f"Evaluación <b>walk-forward</b>: para cada semana del 20% final de datos históricos, "
-        f"el modelo se reentrenó con todo lo anterior y predijo esa semana. "
-        f"Esto refleja cómo rinde el modelo en condiciones reales."
-        f"</div>",
-        unsafe_allow_html=True,
-    )
 
-    if preds["historial"] is None:
+    if preds["historial"] is None and preds["4sem"] is None:
         st.warning(
-            "⚠️ Aún no hay historial de evaluación. "
+            "⚠️ Aún no hay datos de evaluación. "
             "Ejecuta `python -m models.generar_predicciones` desde la terminal."
         )
     else:
-        df_hist = preds["historial"].copy()
-        df_hist["ds"] = pd.to_datetime(df_hist["ds"])
-        df_hist["error_abs"] = (df_hist["real"] - df_hist["prediccion"]).abs()
-
-        # ── Selector de producto
-        productos_hist = ["Todos"] + sorted(df_hist["producto"].unique())
-        plato_prec = st.selectbox("Producto", productos_hist, key="prec_prod")
-
-        df_sel = df_hist if plato_prec == "Todos" else df_hist[df_hist["producto"] == plato_prec]
-
-        # ── Métricas
-        mae_total = df_sel["error_abs"].mean()
-        n_tail = 4 if plato_prec != "Todos" else 4 * df_hist["producto"].nunique()
-        mae_ult4 = df_sel.sort_values("ds").tail(n_tail)["error_abs"].mean()
-        pct_bien = (df_sel["error_abs"] <= mae_total).mean() * 100
-
-        k1, k2, k3 = st.columns(3)
-        k1.metric("MAE histórico (test)", f"{mae_total:.1f} unidades")
-        k2.metric("MAE últimas 4 semanas test", f"{mae_ult4:.1f} unidades")
-        k3.metric("Semanas dentro del MAE", f"{pct_bien:.0f}%")
-
-        st.markdown("---")
-
-        # ── Datos agregados para gráficas
-        tiene_prophet = "prophet" in df_hist.columns
-        if plato_prec == "Todos":
-            agg_dict = dict(real=("real", "sum"),
-                            prediccion=("prediccion", "sum"),
-                            error_abs=("error_abs", "sum"))
-            if tiene_prophet:
-                agg_dict["prophet"] = ("prophet", "sum")
-            df_agg = df_sel.groupby("ds").agg(**agg_dict).reset_index().sort_values("ds")
-        else:
-            df_agg = df_sel.sort_values("ds").reset_index(drop=True)
-
-        # ── Gráfico real vs predicho (+ prophet si está disponible)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df_agg["ds"], y=df_agg["real"],
-            mode="lines+markers", name="Real",
-            line=dict(color=VERDE, width=2.5),
-            marker=dict(size=7, color=VERDE),
-        ))
-        if "prophet" in df_agg.columns:
-            fig.add_trace(go.Scatter(
-                x=df_agg["ds"], y=df_agg["prophet"],
-                mode="lines+markers", name="Prophet solo",
-                line=dict(color=GRIS_SUAVE, width=1.8, dash="dot"),
-                marker=dict(size=5, color=GRIS_SUAVE),
-            ))
-        fig.add_trace(go.Scatter(
-            x=df_agg["ds"], y=df_agg["prediccion"],
-            mode="lines+markers", name="Híbrido (Prophet+XGB)",
-            line=dict(color=AMARILLO, width=2.5, dash="dash"),
-            marker=dict(size=7, symbol="diamond", color=AMARILLO,
-                        line=dict(color=MOSTAZA, width=1.5)),
-        ))
-        fig.update_layout(
-            height=380,
-            title=f"Real vs Predicho — {plato_prec}",
-            title_font=dict(color=VERDE_OSCURO),
-            plot_bgcolor=CREMA, paper_bgcolor=CREMA,
-            font=dict(color=CARBON),
-            margin=dict(t=50, b=40, l=60, r=20),
-            xaxis=dict(showgrid=False, title="Semana"),
-            yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
-            legend=dict(orientation="h", y=1.12, x=0),
-            hovermode="x unified",
+        # ════════════════════════════════════════════════════════
+        # SECCIÓN 1: SEGUIMIENTO EN VIVO (modelo de producción)
+        # ════════════════════════════════════════════════════════
+        st.markdown("### ✅ Seguimiento en vivo — Modelo de producción")
+        st.markdown(
+            f"<div class='caja-info'>"
+            f"Estas predicciones fueron generadas por el <b>modelo final</b>, reentrenado con "
+            f"<b>todos los datos históricos disponibles</b>. Se comparan contra las ventas reales "
+            f"registradas desde la última ejecución del pipeline."
+            f"</div>",
+            unsafe_allow_html=True,
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-        # ── Error absoluto por semana
-        mae_linea = df_agg["error_abs"].mean()
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(
-            x=df_agg["ds"], y=df_agg["error_abs"],
-            marker_color=AMARILLO, name="Error absoluto",
-        ))
-        fig2.add_hline(
-            y=mae_linea, line_dash="dash", line_color=VERDE_OSCURO,
-            annotation_text=f"MAE: {mae_linea:.1f}",
-            annotation_position="top right",
-        )
-        fig2.update_layout(
-            height=250,
-            title="Error absoluto por semana",
-            title_font=dict(color=VERDE_OSCURO),
-            plot_bgcolor=CREMA, paper_bgcolor=CREMA,
-            font=dict(color=CARBON),
-            yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
-            xaxis=dict(showgrid=False),
-            margin=dict(t=40, b=40, l=60, r=20),
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # ── Tabla resumen por producto
-        st.markdown("### Precisión por producto")
-        resumen_prec = (
-            df_hist.groupby("producto")["error_abs"]
-            .agg(MAE="mean", Error_max="max", Error_mediano="median", Semanas="count")
-            .round(1).reset_index()
-            .sort_values("MAE")
-        )
-        resumen_prec.columns = ["Producto", "MAE (unidades)", "Error máx.", "Error mediano", "Semanas test"]
-        st.dataframe(resumen_prec, use_container_width=True, hide_index=True)
-
-        # ── Seguimiento predicciones futuras que ya pasaron
         if preds["4sem"] is not None:
             df_fut = preds["4sem"].copy()
             df_fut["fecha"] = pd.to_datetime(df_fut["fecha"])
@@ -874,21 +822,11 @@ with tab_precision:
             pasadas = df_fut[df_fut["fecha"] < hoy]
 
             if not pasadas.empty:
-                st.markdown("---")
-                st.markdown("### 🆕 Seguimiento de predicciones en vivo")
-                st.markdown(
-                    f"<div class='caja-info'>"
-                    f"El modelo hizo {len(pasadas)} predicciones para fechas que ya transcurrieron. "
-                    f"Se comparan con las ventas reales registradas.</div>",
-                    unsafe_allow_html=True,
-                )
-
                 # Alinear ventas reales por semana (lunes)
                 v_sem = ventas.copy()
                 v_sem["ds"] = v_sem["Fecha"].apply(
                     lambda x: x - pd.Timedelta(days=x.weekday())
                 ).dt.normalize()
-                # Combinar las dos variantes de "Arma tu plato"
                 v_sem.loc[v_sem["Nombre"].isin(["Arma tu plato Grande(21k)",
                                                  "Arma tu plato mediano (18k)"]),
                           "Nombre"] = "Arma tu plato (combinado)"
@@ -914,13 +852,139 @@ with tab_precision:
 
                 if not con_real.empty:
                     mae_vivo = con_real["Error"].mean()
-                    st.metric("MAE predicciones en vivo", f"{mae_vivo:.1f} unidades")
+                    st.metric("MAE modelo de producción (semanas transcurridas)", f"{mae_vivo:.1f} unidades")
                     st.dataframe(con_real, use_container_width=True, hide_index=True)
                 else:
                     st.info(
                         "Las fechas predichas ya pasaron pero aún no hay ventas reales "
                         "registradas en el CSV para esas semanas."
                     )
+            else:
+                st.info(
+                    "Las predicciones vigentes son para semanas futuras. "
+                    "Cuando esas semanas transcurran aparecerá aquí la comparación contra lo real."
+                )
+        else:
+            st.info("Sin predicciones de producción disponibles. Ejecuta el pipeline primero.")
+
+        st.markdown("---")
+
+        # ════════════════════════════════════════════════════════
+        # SECCIÓN 2: EVALUACIÓN HISTÓRICA (walk-forward)
+        # ════════════════════════════════════════════════════════
+        st.markdown("### 🔬 Evaluación histórica — walk-forward")
+        st.markdown(
+            f"<div class='caja-info'>"
+            f"Para validar el modelo, en el <b>20% final de los datos históricos</b> se simuló "
+            f"cómo habría predicho el modelo <b>sin ver el futuro</b> (el modelo se reentrenó "
+            f"solo con datos anteriores a cada semana evaluada). "
+            f"<b>Esto NO son las predicciones de producción</b>, sino una métrica de validación."
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if preds["historial"] is None:
+            st.warning("Sin historial de evaluación. Ejecuta `python -m models.generar_predicciones`.")
+        else:
+            df_hist = preds["historial"].copy()
+            df_hist["ds"] = pd.to_datetime(df_hist["ds"])
+            df_hist["error_abs"] = (df_hist["real"] - df_hist["prediccion"]).abs()
+
+            productos_hist = ["Todos"] + sorted(df_hist["producto"].unique())
+            plato_prec = st.selectbox("Producto", productos_hist, key="prec_prod")
+
+            df_sel = df_hist if plato_prec == "Todos" else df_hist[df_hist["producto"] == plato_prec]
+
+            mae_total = df_sel["error_abs"].mean()
+            n_tail = 4 if plato_prec != "Todos" else 4 * df_hist["producto"].nunique()
+            mae_ult4 = df_sel.sort_values("ds").tail(n_tail)["error_abs"].mean()
+            pct_bien = (df_sel["error_abs"] <= mae_total).mean() * 100
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("MAE validación walk-forward", f"{mae_total:.1f} unidades")
+            k2.metric("MAE últimas 4 semanas (validación)", f"{mae_ult4:.1f} unidades")
+            k3.metric("Semanas dentro del MAE", f"{pct_bien:.0f}%")
+
+            st.markdown("---")
+
+            tiene_prophet = "prophet" in df_hist.columns
+            if plato_prec == "Todos":
+                agg_dict = dict(real=("real", "sum"),
+                                prediccion=("prediccion", "sum"),
+                                error_abs=("error_abs", "sum"))
+                if tiene_prophet:
+                    agg_dict["prophet"] = ("prophet", "sum")
+                df_agg = df_sel.groupby("ds").agg(**agg_dict).reset_index().sort_values("ds")
+            else:
+                df_agg = df_sel.sort_values("ds").reset_index(drop=True)
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df_agg["ds"], y=df_agg["real"],
+                mode="lines+markers", name="Real",
+                line=dict(color=VERDE, width=2.5),
+                marker=dict(size=7, color=VERDE),
+            ))
+            if "prophet" in df_agg.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_agg["ds"], y=df_agg["prophet"],
+                    mode="lines+markers", name="Prophet solo",
+                    line=dict(color=GRIS_SUAVE, width=1.8, dash="dot"),
+                    marker=dict(size=5, color=GRIS_SUAVE),
+                ))
+            fig.add_trace(go.Scatter(
+                x=df_agg["ds"], y=df_agg["prediccion"],
+                mode="lines+markers", name="Híbrido (Prophet+XGB)",
+                line=dict(color=AMARILLO, width=2.5, dash="dash"),
+                marker=dict(size=7, symbol="diamond", color=AMARILLO,
+                            line=dict(color=MOSTAZA, width=1.5)),
+            ))
+            fig.update_layout(
+                height=380,
+                title=f"Real vs Predicho — evaluación walk-forward ({plato_prec})",
+                title_font=dict(color=VERDE_OSCURO),
+                plot_bgcolor=CREMA, paper_bgcolor=CREMA,
+                font=dict(color=CARBON),
+                margin=dict(t=50, b=40, l=60, r=20),
+                xaxis=dict(showgrid=False, title="Semana"),
+                yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
+                legend=dict(orientation="h", y=1.12, x=0),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            mae_linea = df_agg["error_abs"].mean()
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=df_agg["ds"], y=df_agg["error_abs"],
+                marker_color=AMARILLO, name="Error absoluto",
+            ))
+            fig2.add_hline(
+                y=mae_linea, line_dash="dash", line_color=VERDE_OSCURO,
+                annotation_text=f"MAE: {mae_linea:.1f}",
+                annotation_position="top right",
+            )
+            fig2.update_layout(
+                height=250,
+                title="Error absoluto por semana (walk-forward)",
+                title_font=dict(color=VERDE_OSCURO),
+                plot_bgcolor=CREMA, paper_bgcolor=CREMA,
+                font=dict(color=CARBON),
+                yaxis=dict(title="Unidades", showgrid=True, gridcolor="#E0DDD3"),
+                xaxis=dict(showgrid=False),
+                margin=dict(t=40, b=40, l=60, r=20),
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+            st.markdown("### Precisión por producto (walk-forward)")
+            resumen_prec = (
+                df_hist.groupby("producto")["error_abs"]
+                .agg(MAE="mean", Error_max="max", Error_mediano="median", Semanas="count")
+                .round(1).reset_index()
+                .sort_values("MAE")
+            )
+            resumen_prec.columns = ["Producto", "MAE (unidades)", "Error máx.", "Error mediano", "Semanas validación"]
+            st.dataframe(resumen_prec, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
