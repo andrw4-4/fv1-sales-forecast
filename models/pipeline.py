@@ -154,6 +154,52 @@ def walk_forward_test(df_modelo, corte_test, features, xgb_params):
     }
 
 
+def walk_forward_multistep(df_modelo, corte_test, features, xgb_params, horizonte=4):
+    """
+    Para cada origen en el test, predice h=1..horizonte pasos usando
+    predicciones previas como lags (igual que en producción).
+    Devuelve el percentil 80 de errores absolutos por horizonte.
+    """
+    from xgboost import XGBRegressor
+
+    errores_por_h = {h: [] for h in range(1, horizonte + 1)}
+    origenes = range(corte_test, len(df_modelo) - horizonte + 1)
+
+    for origen in origenes:
+        train = df_modelo.iloc[:origen]
+        model = XGBRegressor(**xgb_params, random_state=42, n_jobs=-1, verbosity=0)
+        model.fit(train[features], train["y"] - train["yhat"])
+
+        y_hist = list(df_modelo["y"].iloc[:origen].values)
+
+        for h in range(1, horizonte + 1):
+            idx = origen + h - 1
+            if idx >= len(df_modelo):
+                break
+
+            fila = df_modelo.iloc[[idx]].copy()
+            if len(y_hist) >= 1: fila["lag_1"] = y_hist[-1]
+            if len(y_hist) >= 2: fila["lag_2"] = y_hist[-2]
+            if len(y_hist) >= 4: fila["lag_4"] = y_hist[-4]
+            if len(y_hist) >= 4: fila["rolling_4"] = float(np.mean(y_hist[-4:]))
+            if len(y_hist) >= 8: fila["rolling_8"] = float(np.mean(y_hist[-8:]))
+            fila["lag_1_clean"] = fila["lag_1"]
+
+            pred = max(0.0, float(fila["yhat"].iloc[0]) +
+                       float(model.predict(fila[features].fillna(0).values)[0]))
+
+            real = float(df_modelo["y"].iloc[idx])
+            if real > 0:
+                errores_por_h[h].append(abs(real - pred))
+            y_hist.append(pred)
+
+    # Percentil 80 de errores absolutos por horizonte
+    return {
+        h: float(np.percentile(errs, 80)) if len(errs) >= 3 else None
+        for h, errs in errores_por_h.items()
+    }
+
+
 # ───────────────────────────────────────────────────────────────
 # Pipeline completo por producto
 # ───────────────────────────────────────────────────────────────
@@ -229,9 +275,10 @@ def pipeline_producto(ventas, producto, vacaciones,
     proxima_semana = (serie["ds"].max() + pd.Timedelta(weeks=1)).normalize()
     proxima_semana = proxima_semana - pd.Timedelta(days=proxima_semana.weekday())
 
-    # Estimar std de residuos del walk-forward para intervalos de confianza
+    # Intervalos calibrados: walk-forward multi-paso por horizonte
     residuos_test = wf["reales"] - wf["predicciones"]
     std_residual = float(np.std(residuos_test)) if len(residuos_test) > 1 else 0.0
+    cuantiles_h = walk_forward_multistep(df_modelo, corte_test, FEATURES_MODELO, best_xgb)
 
     # Construir serie extendida con H semanas adicionales para calcular features
     serie_extendida = expandir_calendario(serie, semanas_adicionales=horizonte)
@@ -273,13 +320,12 @@ def pipeline_producto(ventas, producto, vacaciones,
         residuo_h = float(modelo_final.predict(fila_X.values)[0])
         prediccion_h = max(0.0, yhat_h + residuo_h)
 
-        # Intervalo basado en std de residuos del walk-forward (±1 std ≈ 68%)
-        # Se ensancha suavemente con el horizonte pero queda acotado
-        ancho_total = std_residual * (1.0 + 0.15 * (h - 1))
+        # Intervalo calibrado: percentil 80 de errores reales a este horizonte
+        # Si no hay suficientes datos, cae a std_residual como fallback
+        ancho_total = cuantiles_h.get(h) or std_residual * (1.0 + 0.15 * (h - 1))
 
-        # "Probabilidad" o confianza: arbitraria pero intuitiva.
-        # Decae con h: 1 sem ~85%, 2 sem ~70%, 3 sem ~55%, 4 sem ~45%
-        confianza_pct = max(20, 95 - h * 13)
+        # Confianza: refleja cobertura empírica del p80 (~80%) decayendo levemente
+        confianza_pct = max(50, 80 - (h - 1) * 7)
 
         predicciones_futuras.append({
             "semana_offset": h,
