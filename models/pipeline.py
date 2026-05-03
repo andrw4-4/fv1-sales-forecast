@@ -273,11 +273,9 @@ def pipeline_producto(ventas, producto, vacaciones,
         residuo_h = float(modelo_final.predict(fila_X.values)[0])
         prediccion_h = max(0.0, yhat_h + residuo_h)
 
-        # Intervalo de confianza: amplia con sqrt(h) (errores compuestos)
-        # Usa tanto std de residuos como el rango Prophet
-        ancho_h = std_residual * np.sqrt(h) * 1.96  # ~95%
-        rango_prophet = max(0, yhat_upper_h - yhat_lower_h) / 2
-        ancho_total = max(ancho_h, rango_prophet)
+        # Intervalo basado en std de residuos del walk-forward (±1 std ≈ 68%)
+        # Se ensancha suavemente con el horizonte pero queda acotado
+        ancho_total = std_residual * (1.0 + 0.15 * (h - 1))
 
         # "Probabilidad" o confianza: arbitraria pero intuitiva.
         # Decae con h: 1 sem ~85%, 2 sem ~70%, 3 sem ~55%, 4 sem ~45%
